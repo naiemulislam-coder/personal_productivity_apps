@@ -2,172 +2,188 @@ package com.naiemulislam.productivity.util.scheduler;
 
 import com.naiemulislam.productivity.data.entity.FixedActivity;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
 
 /**
- * Deterministic daily scheduling engine (basic implementation).
+ * SchedulerEngine (improved)
+ * - Respects fixed activities (busy intervals)
+ * - Orders tasks by: dependency order, priority (desc), deadline (asc), estimated (asc)
+ * - Supports chunking across multiple slots
+ * - Respects buffer minutes between tasks
+ * - Performs simple dependency handling via topological sort (cycles cause involved tasks to be unscheduled)
  *
- * Inputs are TaskRequest list, FixedActivity list and the day's wake/sleep window.
- * Output is a list of ScheduledTask objects representing allocated time ranges.
- *
- * Note: This is a core algorithm suitable for unit-testing and iteration. It's
- * independent from Room entities for scheduling metadata (TaskRequest is a
- * lightweight DTO). Later we can integrate TaskRequest with DB Task entity
- * fields, handle dependencies, priority inheritance, day cut-off logic, etc.
+ * This class is pure Java and suitable for unit testing.
  */
 public class SchedulerEngine {
 
-    // default buffer minutes between tasks
-    private final int bufferMinutes = 10;
+    private final int bufferMinutes;
 
-    public SchedulerEngine() {}
+    public SchedulerEngine() { this(10); }
+    public SchedulerEngine(int bufferMinutes) { this.bufferMinutes = Math.max(0, bufferMinutes); }
 
-    /**
-     * Generate a daily schedule between dayStartMillis (inclusive) and dayEndMillis (exclusive).
-     * All times use epoch milliseconds (UTC or device local millis consistently).
-     *
-     * @param tasks           list of tasks to schedule (TaskRequest)
-     * @param fixedActivities list of fixed activities that block time (startTime & durationMinutes)
-     * @param dayStartMillis  day start (wake time) epoch ms
-     * @param dayEndMillis    day end (sleep time) epoch ms
-     * @return ScheduleResult containing scheduled tasks and unscheduled tasks
-     */
     public ScheduleResult generateDailySchedule(List<TaskRequest> tasks,
                                                 List<FixedActivity> fixedActivities,
                                                 long dayStartMillis,
                                                 long dayEndMillis) {
-        // Guard
+        if (tasks == null) tasks = new ArrayList<>();
+        if (fixedActivities == null) fixedActivities = new ArrayList<>();
+
+        // Validate window
         if (dayEndMillis <= dayStartMillis) {
-            return new ScheduleResult(new ArrayList<>(), tasks); // invalid window -> nothing scheduled
+            return new ScheduleResult(new ArrayList<>(), tasks);
         }
 
-        // Build busy intervals from fixed activities clipped to day window
+        // Build busy intervals
         List<Interval> busy = new ArrayList<>();
         for (FixedActivity fa : fixedActivities) {
-            long faStart = fa.startTime;
-            long faEnd = faStart + (long) fa.durationMinutes * 60_000L;
-            // Clip to day window
-            long s = Math.max(faStart, dayStartMillis);
-            long e = Math.min(faEnd, dayEndMillis);
+            long s = Math.max(fa.startTime, dayStartMillis);
+            long e = Math.min(fa.startTime + (long)fa.durationMinutes * 60_000L, dayEndMillis);
             if (e > s) busy.add(new Interval(s, e));
         }
-
-        // Merge overlapping busy intervals
         Collections.sort(busy, Comparator.comparingLong(i -> i.start));
-        List<Interval> mergedBusy = new ArrayList<>();
-        for (Interval it : busy) {
-            if (mergedBusy.isEmpty()) mergedBusy.add(it);
-            else {
-                Interval last = mergedBusy.get(mergedBusy.size() - 1);
-                if (it.start <= last.end) {
-                    last.end = Math.max(last.end, it.end);
-                } else mergedBusy.add(it);
+        List<Interval> mergedBusy = mergeIntervals(busy);
+
+        // Build available slots
+        List<Slot> slots = buildSlotsFromBusy(mergedBusy, dayStartMillis, dayEndMillis);
+
+        // Prepare tasks: map + incoming degree for dependencies
+        Map<Long, TaskRequest> idMap = new HashMap<>();
+        for (TaskRequest t : tasks) idMap.put(t.taskId, t);
+
+        Map<Long, Integer> indegree = new HashMap<>();
+        Map<Long, List<Long>> graph = new HashMap<>();
+        for (TaskRequest t : tasks) {
+            indegree.put(t.taskId, 0);
+            graph.put(t.taskId, new ArrayList<>());
+        }
+
+        for (TaskRequest t : tasks) {
+            if (t.dependsOnIds != null) {
+                for (Long dep : t.dependsOnIds) {
+                    if (!idMap.containsKey(dep)) continue; // missing dep ignored
+                    graph.get(dep).add(t.taskId);
+                    indegree.put(t.taskId, indegree.getOrDefault(t.taskId, 0) + 1);
+                }
             }
         }
 
-        // Build available slots between dayStartMillis and dayEndMillis
-        List<Slot> slots = new ArrayList<>();
-        long cursor = dayStartMillis;
-        for (Interval b : mergedBusy) {
-            if (b.start > cursor) {
-                slots.add(new Slot(cursor, b.start));
-            }
-            cursor = Math.max(cursor, b.end);
-        }
-        if (cursor < dayEndMillis) slots.add(new Slot(cursor, dayEndMillis));
+        // Kahn's algorithm for topological sort combined with priority ordering
+        Queue<Long> queue = new ArrayDeque<>();
+        for (Map.Entry<Long,Integer> e : indegree.entrySet()) if (e.getValue() == 0) queue.add(e.getKey());
 
-        // Sort tasks by priority desc, deadline asc, estimatedMinutes asc
-        List<TaskRequest> sorted = new ArrayList<>(tasks);
-        Collections.sort(sorted, (a, b) -> {
-            if (a.priority != b.priority) return Integer.compare(b.priority, a.priority);
-            int dl = Long.compare(a.deadline, b.deadline);
-            if (dl != 0) return dl;
-            return Integer.compare(a.estimatedMinutes, b.estimatedMinutes);
-        });
+        List<TaskRequest> ordered = new ArrayList<>();
+        while (!queue.isEmpty()) {
+            // pick best candidate from queue based on priority/deadline/estimate
+            List<TaskRequest> candidates = new ArrayList<>();
+            for (Long id : queue) candidates.add(idMap.get(id));
+            candidates.sort((a,b) -> {
+                if (a.priority != b.priority) return Integer.compare(b.priority, a.priority);
+                int dl = Long.compare(a.deadline, b.deadline);
+                if (dl != 0) return dl;
+                return Integer.compare(a.estimatedMinutes, b.estimatedMinutes);
+            });
+            TaskRequest pick = candidates.get(0);
+            // remove pick from queue
+            queue.remove(pick.taskId);
+            ordered.add(pick);
+            // reduce indegree of neighbors
+            for (Long nbr : graph.get(pick.taskId)) {
+                indegree.put(nbr, indegree.get(nbr) - 1);
+                if (indegree.get(nbr) == 0) queue.add(nbr);
+            }
+        }
+
+        // Any tasks remaining with indegree >0 are part of cycles -> unscheduled
+        Set<Long> inCycle = new HashSet<>();
+        for (Map.Entry<Long,Integer> e : indegree.entrySet()) if (e.getValue() > 0) inCycle.add(e.getKey());
 
         List<ScheduledTask> scheduled = new ArrayList<>();
         List<TaskRequest> unscheduled = new ArrayList<>();
 
-        for (TaskRequest task : sorted) {
+        // Try to schedule ordered tasks
+        for (TaskRequest task : ordered) {
+            if (inCycle.contains(task.taskId)) {
+                unscheduled.add(task);
+                continue;
+            }
             int remaining = task.estimatedMinutes;
             boolean placed = false;
 
-            // Try to find a single slot big enough first
+            // first pass: try to place single contiguous chunk
             for (Slot slot : slots) {
-                int availableMinutes = slot.remainingMinutes();
-                if (availableMinutes <= 0) continue;
-
-                // We require buffer after allocation except when filling to slot end
-                int needed = remaining;
-                if (availableMinutes >= needed) {
+                int available = slot.remainingMinutes();
+                if (available <= 0) continue;
+                if (available >= remaining) {
                     long start = slot.currentStartMillis();
-                    long end = start + (long) needed * 60_000L;
-                    scheduled.add(new ScheduledTask(task.taskId, task.name, start, end, task.estimatedMinutes, false));
-                    slot.advanceByMinutes(needed + bufferMinutes);
+                    long end = start + (long)remaining * 60_000L;
+                    scheduled.add(new ScheduledTask(task.taskId, task.name, start, end, remaining, false));
+                    slot.advanceByMinutes(remaining + bufferMinutes);
                     placed = true;
                     remaining = 0;
                     break;
                 }
             }
 
-            // If not placed and chunking allowed, try to allocate across multiple slots
+            // second pass: chunking across slots if allowed
             if (!placed && task.allowChunking) {
                 for (Slot slot : slots) {
-                    int availableMinutes = slot.remainingMinutes();
-                    if (availableMinutes <= 0) continue;
-                    // allocate as much as possible here (reserve buffer after chunk if slot still has space)
-                    int take = Math.max(0, availableMinutes - bufferMinutes);
-                    if (take <= 0) {
-                        // not enough to allocate meaningful chunk (only buffer would remain)
-                        continue;
-                    }
-                    int toAllocate = Math.min(take, remaining);
+                    int available = slot.remainingMinutes();
+                    if (available <= 0) continue;
+                    int usable = Math.max(0, available - bufferMinutes);
+                    if (usable <= 0) continue;
+                    int take = Math.min(usable, remaining);
                     long start = slot.currentStartMillis();
-                    long end = start + (long) toAllocate * 60_000L;
-                    scheduled.add(new ScheduledTask(task.taskId, task.name, start, end, toAllocate, true));
-                    slot.advanceByMinutes(toAllocate + bufferMinutes);
-                    remaining -= toAllocate;
+                    long end = start + (long)take * 60_000L;
+                    scheduled.add(new ScheduledTask(task.taskId, task.name, start, end, take, true));
+                    slot.advanceByMinutes(take + bufferMinutes);
+                    remaining -= take;
                     if (remaining <= 0) { placed = true; break; }
                 }
             }
 
-            if (!placed) {
-                // Couldn't schedule fully
-                unscheduled.add(task);
-            }
+            if (!placed) unscheduled.add(task);
         }
+
+        // Add tasks that were not reachable in ordering (e.g., due to missing from map) but exist in original list
+        for (TaskRequest t : tasks) if (!idMap.containsKey(t.taskId)) unscheduled.add(t);
 
         return new ScheduleResult(scheduled, unscheduled);
     }
 
-    // --- helper classes ---
-    private static class Interval {
-        long start;
-        long end;
-
-        Interval(long s, long e) { start = s; end = e; }
+    private static List<Interval> mergeIntervals(List<Interval> intervals) {
+        List<Interval> out = new ArrayList<>();
+        for (Interval it : intervals) {
+            if (out.isEmpty()) out.add(new Interval(it.start, it.end));
+            else {
+                Interval last = out.get(out.size()-1);
+                if (it.start <= last.end) last.end = Math.max(last.end, it.end);
+                else out.add(new Interval(it.start, it.end));
+            }
+        }
+        return out;
     }
 
-    private static class Slot {
-        long start;
-        long end;
-        long cursor; // current cursor of allocation
-
-        Slot(long s, long e) { start = s; end = e; cursor = s; }
-
-        int remainingMinutes() {
-            long ms = Math.max(0L, end - cursor);
-            return (int) (ms / 60_000L);
+    private static List<Slot> buildSlotsFromBusy(List<Interval> busy, long dayStart, long dayEnd) {
+        List<Slot> slots = new ArrayList<>();
+        long cursor = dayStart;
+        for (Interval b : busy) {
+            if (b.start > cursor) slots.add(new Slot(cursor, b.start));
+            cursor = Math.max(cursor, b.end);
         }
-
-        long currentStartMillis() { return cursor; }
-
-        void advanceByMinutes(int minutes) {
-            long ms = (long) minutes * 60_000L;
-            cursor = Math.min(end, cursor + ms);
-        }
+        if (cursor < dayEnd) slots.add(new Slot(cursor, dayEnd));
+        return slots;
     }
+
+    // --- helpers ---
+    private static class Interval { long start; long end; Interval(long s,long e){start=s;end=e;} }
+    private static class Slot { long start; long end; long cursor; Slot(long s,long e){start=s;end=e;cursor=s;} int remainingMinutes(){ long ms = Math.max(0L,end-cursor); return (int)(ms/60_000L);} long currentStartMillis(){return cursor;} void advanceByMinutes(int m){ long ms=(long)m*60_000L; cursor = Math.min(end, cursor+ms);} }
 }
