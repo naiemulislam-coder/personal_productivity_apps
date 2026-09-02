@@ -10,6 +10,7 @@ import com.naiemulislam.productivity.data.dao.FixedActivityDao;
 import com.naiemulislam.productivity.data.dao.FocusSessionDao;
 import com.naiemulislam.productivity.data.dao.DailyScoreDao;
 import com.naiemulislam.productivity.data.dao.RescheduleHistoryDao;
+import com.naiemulislam.productivity.data.dao.TaskDependencyDao;
 import com.naiemulislam.productivity.data.entity.Task;
 import com.naiemulislam.productivity.data.entity.Goal;
 import com.naiemulislam.productivity.data.entity.Routine;
@@ -17,6 +18,7 @@ import com.naiemulislam.productivity.data.entity.FixedActivity;
 import com.naiemulislam.productivity.data.entity.FocusSession;
 import com.naiemulislam.productivity.data.entity.DailyScore;
 import com.naiemulislam.productivity.data.entity.RescheduleHistory;
+import com.naiemulislam.productivity.data.entity.TaskDependency;
 
 import java.util.List;
 
@@ -28,6 +30,7 @@ public class AppRepository {
     private final FocusSessionDao focusSessionDao;
     private final DailyScoreDao dailyScoreDao;
     private final RescheduleHistoryDao rescheduleHistoryDao;
+    private final TaskDependencyDao taskDependencyDao;
 
     public AppRepository(Context context) {
         AppDatabase db = AppDatabase.getInstance(context);
@@ -38,11 +41,22 @@ public class AppRepository {
         focusSessionDao = db.focusSessionDao();
         dailyScoreDao = db.dailyScoreDao();
         rescheduleHistoryDao = db.rescheduleHistoryDao();
+        taskDependencyDao = db.taskDependencyDao();
     }
 
     // Task
     public long insertTask(Task task) { return taskDao.insert(task); }
+    public int updateTask(Task task) { return taskDao.update(task); }
+    public int deleteTask(Task task) { return taskDao.delete(task); }
     public List<Task> getAllTasks() { return taskDao.getAll(); }
+    public Task getTaskById(long id) { return taskDao.getById(id); }
+    public List<Task> getTasksForWindow(long start, long end) { return taskDao.getTasksForWindow(start, end); }
+    public List<Task> getUnscheduledTasks() { return taskDao.getUnscheduled(); }
+
+    // Task dependencies
+    public long insertDependency(TaskDependency d) { return taskDependencyDao.insert(d); }
+    public List<TaskDependency> getDependenciesForTask(long taskId) { return taskDependencyDao.getDependenciesForTask(taskId); }
+    public void deleteDependenciesForTask(long taskId) { taskDependencyDao.deleteForTask(taskId); }
 
     // Goal
     public long insertGoal(Goal goal) { return goalDao.insert(goal); }
